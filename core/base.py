@@ -32,7 +32,7 @@ class SoftDeleteMixin:
 
 
 class BaseModel(Base, IDMixin, TimestampsMixin, SoftDeleteMixin):
-    """Abstract base shared by all CRUD models.
+    """Abstract base shared by all domain models.
 
     Provides: incremental integer id, created_at, and soft-delete.
     """

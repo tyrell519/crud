@@ -6,27 +6,53 @@ A small REST API built with **FastAPI**, **SQLAlchemy 2.0**, and **SQLite**. It 
 
 - 3 endpoints, 3 tables: `users`, `products`, `orders`
 - Full CRUD per endpoint (POST, GET list, GET by id, PUT, DELETE)
-- SQLAlchemy 2.0 ORM: typed `Mapped`/`mapped_column` models with relationships
-- Shared declarative mixins (`base.py`): auto-incrementing integer `id`, `created_at`, soft delete
+- Layered modular monolith (DDD style): each domain has its own model, schemas, repository, service, and router
+- Dependency injection via FastAPI `Depends` (`get_db → repository → service`); services and repositories are plain classes, unit-testable without FastAPI
+- SQLAlchemy 2.0 ORM: typed `Mapped`/`mapped_column` models
+- Shared declarative mixins (`core/base.py`): auto-incrementing integer `id`, `created_at`, soft delete
 - Soft delete: `DELETE` flags the row (`deleted_at`) instead of removing it; soft-deleted rows are hidden from all reads (404)
 - Pydantic request validation (types, min/max, email format)
-- Foreign key enforcement (`orders` references `users` and `products`)
+- Cross-domain rules in services: an order must reference a live user and product (else 404); DB foreign keys as a backstop
 - Interactive API docs (Swagger UI at `/docs`)
 
 ## Project structure
 
 ```
 .
-├── main.py          # FastAPI app, routes, CRUD router factory
-├── database.py      # SQLAlchemy engine, session factory, declarative base
-├── base.py          # IDMixin, TimestampsMixin, SoftDeleteMixin + abstract BaseModel
-├── models.py        # SQLAlchemy 2.0 ORM models (User, Product, Order)
-├── schemas.py       # Pydantic request/response schemas
-├── requirements.txt # Python dependencies
-└── crud.db          # SQLite database (created at runtime, git-ignored)
+├── main.py            # App assembly: routers, exception handlers, lifespan
+├── database.py        # SQLAlchemy engine, session factory, declarative base
+├── core/              # Shared kernel
+│   ├── base.py        # IDMixin, TimestampsMixin, SoftDeleteMixin + abstract BaseModel
+│   ├── exceptions.py  # Domain errors: NotFoundError, ConflictError
+│   └── repositories.py# BaseRepository — generic session-scoped data access
+├── domains/           # One self-contained package per domain
+│   ├── users/         # models, schemas, repository, service, router, dependencies
+│   ├── products/      # same layout
+│   └── orders/        # same layout; OrderService validates users + products
+├── tests/             # Unit tests for services/repositories (no FastAPI)
+├── requirements.txt   # Runtime dependencies
+├── requirements-dev.txt
+└── crud.db            # SQLite database (created at runtime, git-ignored)
 ```
 
-All models inherit from `BaseModel` in `base.py`, which composes three declarative mixins:
+### Architecture
+
+Layered, one direction of dependency per request:
+
+```
+HTTP request → router (domains/*/router.py)
+                 → service (domains/*/service.py)   ← business rules
+                 → repository (domains/*/repository.py) ← data access
+                 → SQLAlchemy session → SQLite
+```
+
+- **Routers** are thin adapters: parse the request, call the service, return the result
+- **Services** own business rules, including cross-domain invariants (`OrderService` reads through `UserRepository`/`ProductRepository` to verify targets exist and are not soft-deleted)
+- **Repositories** own all SQLAlchemy access and translate ORM `IntegrityError`s into domain exceptions (`ConflictError`), so services never import SQLAlchemy error types
+- **Injection**: each domain's `dependencies.py` builds the `Depends` chain (`get_db → repository → service`). Because repositories and services are plain classes with constructor injection, tests construct them directly with an in-memory session — no FastAPI, no HTTP
+- **Error mapping**: domain exceptions are raised in services/repositories and mapped to HTTP status codes once, in `main.py` (`NotFoundError` → 404, `ConflictError` → 400)
+
+All models inherit from `BaseModel` in `core/base.py`, which composes three declarative mixins:
 
 | Mixin             | Provides                                    |
 |-------------------|---------------------------------------------|
@@ -44,6 +70,7 @@ All models inherit from `BaseModel` in `base.py`, which composes three declarati
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements-dev.txt   # only needed to run the tests
 ```
 
 ## Run
@@ -124,8 +151,8 @@ Replace `/users` with `/products` or `/orders` as needed.
 | 200  | Success (list, get, update)                                    |
 | 201  | Created                                                        |
 | 204  | Deleted                                                        |
-| 400  | Constraint violated (duplicate email, bad foreign key)         |
-| 404  | Resource not found                                             |
+| 400  | Constraint violated (e.g. duplicate email)                     |
+| 404  | Resource not found — including orders referencing a missing or soft-deleted user/product |
 | 422  | Validation error (bad type, out-of-range value, bad email)     |
 
 ## Try the error cases
@@ -136,7 +163,7 @@ curl -X POST http://127.0.0.1:8000/users \
   -H 'Content-Type: application/json' \
   -d '{"name": "Clone", "email": "riley@example.com"}'
 
-# Order with a nonexistent user -> 400 (FK violation)
+# Order with a nonexistent user -> 404 (cross-domain check in OrderService)
 curl -X POST http://127.0.0.1:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{"user_id": 999, "product_id": 1, "quantity": 1}'
@@ -162,6 +189,14 @@ curl -X PUT http://127.0.0.1:8000/users/1 -H 'Content-Type: application/json' -d
 ```
 
 The row still exists in `crud.db` with `deleted_at` populated, so nothing is ever actually lost.
+
+## Tests
+
+```bash
+pytest
+```
+
+The suite in `tests/` exercises services and repositories directly against an in-memory SQLite session — no FastAPI app, no HTTP. It covers id increment, partial updates, unique-conflict → `ConflictError`, soft-delete visibility, and the cross-domain order validations.
 
 ## Full walkthrough
 

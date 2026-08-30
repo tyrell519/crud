@@ -30,6 +30,6 @@ def get_db():
 
 
 def init_db() -> None:
-    import models  # noqa: F401  (registers all tables with Base.metadata)
+    import domains  # noqa: F401  (registers all domain tables with Base.metadata)
 
     Base.metadata.create_all(bind=engine)
