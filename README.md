@@ -1,14 +1,16 @@
-# FastAPI + SQLite CRUD
+# FastAPI + SQLAlchemy CRUD
 
-A small REST API built with **FastAPI** and **SQLite**. It exposes **3 endpoints** (`/users`, `/products`, `/orders`), each backed by its own table, with full create/read/update/delete support.
+A small REST API built with **FastAPI**, **SQLAlchemy 2.0**, and **SQLite**. It exposes **3 endpoints** (`/users`, `/products`, `/orders`), each backed by its own table, with full create/read/update/delete support.
 
 ## Features
 
 - 3 endpoints, 3 tables: `users`, `products`, `orders`
 - Full CRUD per endpoint (POST, GET list, GET by id, PUT, DELETE)
+- SQLAlchemy 2.0 ORM: typed `Mapped`/`mapped_column` models with relationships
+- Shared declarative mixins (`base.py`): auto-incrementing integer `id`, `created_at`, soft delete
+- Soft delete: `DELETE` flags the row (`deleted_at`) instead of removing it; soft-deleted rows are hidden from all reads (404)
 - Pydantic request validation (types, min/max, email format)
 - Foreign key enforcement (`orders` references `users` and `products`)
-- Automatic `created_at` timestamps
 - Interactive API docs (Swagger UI at `/docs`)
 
 ## Project structure
@@ -16,11 +18,21 @@ A small REST API built with **FastAPI** and **SQLite**. It exposes **3 endpoints
 ```
 .
 ├── main.py          # FastAPI app, routes, CRUD router factory
-├── database.py      # SQLite connection + schema (creates tables on startup)
-├── models.py        # Pydantic request/response schemas
+├── database.py      # SQLAlchemy engine, session factory, declarative base
+├── base.py          # IDMixin, TimestampsMixin, SoftDeleteMixin + abstract BaseModel
+├── models.py        # SQLAlchemy 2.0 ORM models (User, Product, Order)
+├── schemas.py       # Pydantic request/response schemas
 ├── requirements.txt # Python dependencies
 └── crud.db          # SQLite database (created at runtime, git-ignored)
 ```
+
+All models inherit from `BaseModel` in `base.py`, which composes three declarative mixins:
+
+| Mixin             | Provides                                    |
+|-------------------|---------------------------------------------|
+| `IDMixin`         | auto-incrementing integer `id` primary key  |
+| `TimestampsMixin` | server-side `created_at`                    |
+| `SoftDeleteMixin` | nullable `deleted_at` + `is_deleted` helper |
 
 ## Requirements
 
@@ -100,7 +112,7 @@ curl http://127.0.0.1:8000/users/1          # get one
 curl -X PUT http://127.0.0.1:8000/users/1 \
   -H 'Content-Type: application/json' \
   -d '{"name": "Riley S."}'                 # partial update (only fields sent change)
-curl -X DELETE http://127.0.0.1:8000/users/1  # delete
+curl -X DELETE http://127.0.0.1:8000/users/1  # soft delete (sets deleted_at)
 ```
 
 Replace `/users` with `/products` or `/orders` as needed.
@@ -137,6 +149,19 @@ curl -X POST http://127.0.0.1:8000/products \
 # Missing resource -> 404
 curl http://127.0.0.1:8000/products/999
 ```
+
+## Soft delete
+
+`DELETE` does not remove the row — it sets `deleted_at`, and the row becomes invisible through the API:
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/users/1   # 204
+curl http://127.0.0.1:8000/users/1             # 404 (hidden)
+curl http://127.0.0.1:8000/users               # list excludes it
+curl -X PUT http://127.0.0.1:8000/users/1 -H 'Content-Type: application/json' -d '{"name":"x"}'  # 404
+```
+
+The row still exists in `crud.db` with `deleted_at` populated, so nothing is ever actually lost.
 
 ## Full walkthrough
 

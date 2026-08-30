@@ -1,11 +1,14 @@
-import sqlite3
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List
 
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
-import database
-from models import (
+import models
+from database import get_db, init_db
+from schemas import (
     OrderCreate,
     OrderOut,
     OrderUpdate,
@@ -20,95 +23,82 @@ from models import (
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    database.init_db()
+    init_db()
     yield
 
 
-app = FastAPI(title="FastAPI + SQLite CRUD", version="1.0.0", lifespan=lifespan)
-
-
-def _fetch(table: str, row_id: int) -> Optional[dict]:
-    with database.get_db() as conn:
-        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
-        return dict(row) if row else None
-
-
-def _insert(table: str, data: dict) -> dict:
-    try:
-        with database.get_db() as conn:
-            cols = ", ".join(data)
-            placeholders = ", ".join(f":{c}" for c in data)
-            cur = conn.execute(
-                f"INSERT INTO {table} ({cols}) VALUES ({placeholders})", data
-            )
-            conn.commit()
-            row = conn.execute(
-                f"SELECT * FROM {table} WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
-            return dict(row)
-    except sqlite3.IntegrityError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+app = FastAPI(
+    title="FastAPI + SQLAlchemy CRUD", version="2.0.0", lifespan=lifespan
+)
 
 
 def make_router(
-    table: str,
     prefix: str,
+    model: type,
     create_model: type,
     update_model: type,
     out_model: type,
 ) -> APIRouter:
     router = APIRouter(prefix=prefix, tags=[prefix[1:]])
+    label = model.__name__.lower()
 
     @router.post("", status_code=201, response_model=out_model)
-    def create(payload: create_model) -> dict:
-        return _insert(table, payload.model_dump())
+    def create(payload: create_model, db: Session = Depends(get_db)):
+        try:
+            item = model(**payload.model_dump())
+            db.add(item)
+            db.commit()
+            db.refresh(item)
+            return item
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc.orig))
 
     @router.get("", response_model=List[out_model])
-    def list_all() -> List[dict]:
-        with database.get_db() as conn:
-            rows = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
-        return [dict(r) for r in rows]
+    def list_all(db: Session = Depends(get_db)):
+        stmt = select(model).where(model.deleted_at.is_(None)).order_by(model.id)
+        return db.scalars(stmt).all()
 
     @router.get("/{row_id}", response_model=out_model)
-    def get_one(row_id: int) -> dict:
-        item = _fetch(table, row_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail=f"{table[:-1]} not found")
+    def get_one(row_id: int, db: Session = Depends(get_db)):
+        item = db.get(model, row_id)
+        if item is None or item.is_deleted:
+            raise HTTPException(status_code=404, detail=f"{label} not found")
         return item
 
     @router.put("/{row_id}", response_model=out_model)
-    def update(row_id: int, payload: update_model) -> dict:
-        current = _fetch(table, row_id)
-        if current is None:
-            raise HTTPException(status_code=404, detail=f"{table[:-1]} not found")
-        changes = payload.model_dump(exclude_unset=True)
-        if not changes:
-            return current
+    def update(row_id: int, payload: update_model, db: Session = Depends(get_db)):
+        item = db.get(model, row_id)
+        if item is None or item.is_deleted:
+            raise HTTPException(status_code=404, detail=f"{label} not found")
         try:
-            with database.get_db() as conn:
-                assignments = ", ".join(f"{c} = ?" for c in changes)
-                conn.execute(
-                    f"UPDATE {table} SET {assignments} WHERE id = ?",
-                    (*changes.values(), row_id),
-                )
-                conn.commit()
-        except sqlite3.IntegrityError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        return _fetch(table, row_id)
+            for field, value in payload.model_dump(exclude_unset=True).items():
+                setattr(item, field, value)
+            db.commit()
+            db.refresh(item)
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc.orig))
+        return item
 
     @router.delete("/{row_id}", status_code=204)
-    def delete(row_id: int) -> None:
-        with database.get_db() as conn:
-            cur = conn.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
-            conn.commit()
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail=f"{table[:-1]} not found")
+    def delete(row_id: int, db: Session = Depends(get_db)):
+        item = db.get(model, row_id)
+        if item is None or item.is_deleted:
+            raise HTTPException(status_code=404, detail=f"{label} not found")
+        try:
+            item.deleted_at = func.now()
+            db.commit()
+            db.refresh(item)
+        except IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(status_code=400, detail=str(exc.orig))
 
     return router
 
 
-app.include_router(make_router("users", "/users", UserCreate, UserUpdate, UserOut))
+app.include_router(make_router("/users", models.User, UserCreate, UserUpdate, UserOut))
 app.include_router(
-    make_router("products", "/products", ProductCreate, ProductUpdate, ProductOut)
+    make_router("/products", models.Product, ProductCreate, ProductUpdate, ProductOut)
 )
-app.include_router(make_router("orders", "/orders", OrderCreate, OrderUpdate, OrderOut))
+app.include_router(make_router("/orders", models.Order, OrderCreate, OrderUpdate, OrderOut))
