@@ -13,6 +13,7 @@ A small REST API built with **FastAPI**, **SQLAlchemy 2.0**, and **SQLite**. It 
 - Soft delete: `DELETE` flags the row (`deleted_at`) instead of removing it; soft-deleted rows are hidden from all reads (404)
 - Pydantic request validation (types, min/max, email format)
 - Cross-domain rules in services: an order must reference a live user and product (else 404); DB foreign keys as a backstop
+- HTTP Basic authentication on every endpoint (including `/docs`); credentials configurable via environment
 - Interactive API docs (Swagger UI at `/docs`)
 
 ## Project structure
@@ -24,7 +25,8 @@ A small REST API built with **FastAPI**, **SQLAlchemy 2.0**, and **SQLite**. It 
 ├── core/              # Shared kernel
 │   ├── base.py        # IDMixin, TimestampsMixin, SoftDeleteMixin + abstract BaseModel
 │   ├── exceptions.py  # Domain errors: NotFoundError, ConflictError
-│   └── repositories.py# BaseRepository — generic session-scoped data access
+│   ├── repositories.py# BaseRepository — generic session-scoped data access
+│   └── security.py    # BasicAuthMiddleware — HTTP Basic auth on every route
 ├── domains/           # One self-contained package per domain
 │   ├── users/         # models, schemas, repository, service, router, dependencies
 │   ├── products/      # same layout
@@ -88,12 +90,23 @@ Then open:
 
 The SQLite database (`crud.db`) is created automatically on first start. To reset all data, stop the server and delete the file.
 
+## Authentication
+
+Every endpoint requires **HTTP Basic authentication** — the three CRUD resources *and* the auto-generated `/docs`, `/redoc`, and `/openapi.json` routes. Requests without valid credentials get a `401` with a `WWW-Authenticate: Basic` challenge.
+
+- Default credentials: **`admin` / `admin`**
+- Override with the `CRUD_USERNAME` and `CRUD_PASSWORD` environment variables, e.g. `CRUD_PASSWORD=s3cret uvicorn main:app`
+- Enforced by `BasicAuthMiddleware` in `core/security.py`, which runs at the app edge so no route is left open
+- Supply credentials with `curl -u <user>:<pass>` (or an `Authorization: Basic <base64>` header)
+
+All examples below include `-u admin:admin`.
+
 ## API reference
 
 ### `POST /users` — create a user
 
 ```bash
-curl -X POST http://127.0.0.1:8000/users \
+curl -u admin:admin -X POST http://127.0.0.1:8000/users \
   -H 'Content-Type: application/json' \
   -d '{"name": "Riley", "email": "riley@example.com"}'
 ```
@@ -106,7 +119,7 @@ curl -X POST http://127.0.0.1:8000/users \
 ### `POST /products` — create a product
 
 ```bash
-curl -X POST http://127.0.0.1:8000/products \
+curl -u admin:admin -X POST http://127.0.0.1:8000/products \
   -H 'Content-Type: application/json' \
   -d '{"title": "Keyboard", "price": 79.99, "stock": 12}'
 ```
@@ -120,7 +133,7 @@ curl -X POST http://127.0.0.1:8000/products \
 ### `POST /orders` — create an order
 
 ```bash
-curl -X POST http://127.0.0.1:8000/orders \
+curl -u admin:admin -X POST http://127.0.0.1:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{"user_id": 1, "product_id": 1, "quantity": 2}'
 ```
@@ -134,12 +147,12 @@ curl -X POST http://127.0.0.1:8000/orders \
 ### Shared operations (all three endpoints)
 
 ```bash
-curl http://127.0.0.1:8000/users            # list all
-curl http://127.0.0.1:8000/users/1          # get one
-curl -X PUT http://127.0.0.1:8000/users/1 \
+curl -u admin:admin http://127.0.0.1:8000/users            # list all
+curl -u admin:admin http://127.0.0.1:8000/users/1          # get one
+curl -u admin:admin -X PUT http://127.0.0.1:8000/users/1 \
   -H 'Content-Type: application/json' \
   -d '{"name": "Riley S."}'                 # partial update (only fields sent change)
-curl -X DELETE http://127.0.0.1:8000/users/1  # soft delete (sets deleted_at)
+curl -u admin:admin -X DELETE http://127.0.0.1:8000/users/1  # soft delete (sets deleted_at)
 ```
 
 Replace `/users` with `/products` or `/orders` as needed.
@@ -152,29 +165,33 @@ Replace `/users` with `/products` or `/orders` as needed.
 | 201  | Created                                                        |
 | 204  | Deleted                                                        |
 | 400  | Constraint violated (e.g. duplicate email)                     |
+| 401  | Missing or invalid Basic auth credentials                      |
 | 404  | Resource not found — including orders referencing a missing or soft-deleted user/product |
 | 422  | Validation error (bad type, out-of-range value, bad email)     |
 
 ## Try the error cases
 
 ```bash
+# No credentials -> 401
+curl http://127.0.0.1:8000/users
+
 # Duplicate email -> 400
-curl -X POST http://127.0.0.1:8000/users \
+curl -u admin:admin -X POST http://127.0.0.1:8000/users \
   -H 'Content-Type: application/json' \
   -d '{"name": "Clone", "email": "riley@example.com"}'
 
 # Order with a nonexistent user -> 404 (cross-domain check in OrderService)
-curl -X POST http://127.0.0.1:8000/orders \
+curl -u admin:admin -X POST http://127.0.0.1:8000/orders \
   -H 'Content-Type: application/json' \
   -d '{"user_id": 999, "product_id": 1, "quantity": 1}'
 
 # Negative price -> 422
-curl -X POST http://127.0.0.1:8000/products \
+curl -u admin:admin -X POST http://127.0.0.1:8000/products \
   -H 'Content-Type: application/json' \
   -d '{"title": "Bad", "price": -5}'
 
 # Missing resource -> 404
-curl http://127.0.0.1:8000/products/999
+curl -u admin:admin http://127.0.0.1:8000/products/999
 ```
 
 ## Soft delete
@@ -182,10 +199,10 @@ curl http://127.0.0.1:8000/products/999
 `DELETE` does not remove the row — it sets `deleted_at`, and the row becomes invisible through the API:
 
 ```bash
-curl -X DELETE http://127.0.0.1:8000/users/1   # 204
-curl http://127.0.0.1:8000/users/1             # 404 (hidden)
-curl http://127.0.0.1:8000/users               # list excludes it
-curl -X PUT http://127.0.0.1:8000/users/1 -H 'Content-Type: application/json' -d '{"name":"x"}'  # 404
+curl -u admin:admin -X DELETE http://127.0.0.1:8000/users/1   # 204
+curl -u admin:admin http://127.0.0.1:8000/users/1             # 404 (hidden)
+curl -u admin:admin http://127.0.0.1:8000/users               # list excludes it
+curl -u admin:admin -X PUT http://127.0.0.1:8000/users/1 -H 'Content-Type: application/json' -d '{"name":"x"}'  # 404
 ```
 
 The row still exists in `crud.db` with `deleted_at` populated, so nothing is ever actually lost.
@@ -196,19 +213,19 @@ The row still exists in `crud.db` with `deleted_at` populated, so nothing is eve
 pytest
 ```
 
-The suite in `tests/` exercises services and repositories directly against an in-memory SQLite session — no FastAPI app, no HTTP. It covers id increment, partial updates, unique-conflict → `ConflictError`, soft-delete visibility, and the cross-domain order validations.
+Most of the suite exercises services and repositories directly against an in-memory SQLite session — no FastAPI app, no HTTP — covering id increment, partial updates, unique-conflict → `ConflictError`, soft-delete visibility, and the cross-domain order validations. `tests/test_auth.py` uses FastAPI's `TestClient` to verify every endpoint (including `/docs` and `/openapi.json`) rejects missing/wrong credentials with `401` and accepts valid ones.
 
 ## Full walkthrough
 
 A complete happy path from scratch:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/users    -H 'Content-Type: application/json' -d '{"name":"Riley","email":"riley@example.com"}'
-curl -X POST http://127.0.0.1:8000/products -H 'Content-Type: application/json' -d '{"title":"Keyboard","price":79.99,"stock":12}'
-curl -X POST http://127.0.0.1:8000/orders   -H 'Content-Type: application/json' -d '{"user_id":1,"product_id":1,"quantity":2}'
-curl http://127.0.0.1:8000/users
-curl http://127.0.0.1:8000/products
-curl http://127.0.0.1:8000/orders
-curl -X PUT http://127.0.0.1:8000/orders/1  -H 'Content-Type: application/json' -d '{"quantity":5}'
-curl -X DELETE http://127.0.0.1:8000/orders/1
+curl -u admin:admin -X POST http://127.0.0.1:8000/users    -H 'Content-Type: application/json' -d '{"name":"Riley","email":"riley@example.com"}'
+curl -u admin:admin -X POST http://127.0.0.1:8000/products -H 'Content-Type: application/json' -d '{"title":"Keyboard","price":79.99,"stock":12}'
+curl -u admin:admin -X POST http://127.0.0.1:8000/orders   -H 'Content-Type: application/json' -d '{"user_id":1,"product_id":1,"quantity":2}'
+curl -u admin:admin http://127.0.0.1:8000/users
+curl -u admin:admin http://127.0.0.1:8000/products
+curl -u admin:admin http://127.0.0.1:8000/orders
+curl -u admin:admin -X PUT http://127.0.0.1:8000/orders/1  -H 'Content-Type: application/json' -d '{"quantity":5}'
+curl -u admin:admin -X DELETE http://127.0.0.1:8000/orders/1
 ```

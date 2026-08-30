@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 import database
 from core.exceptions import ConflictError, NotFoundError
+from core.security import BasicAuthMiddleware
 from domains.orders.router import router as orders_router
 from domains.products.router import router as products_router
 from domains.users.router import router as users_router
@@ -17,6 +18,9 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="FastAPI + SQLAlchemy CRUD", version="3.0.0", lifespan=lifespan)
+
+# Enforce Basic auth on every route (API endpoints + /docs + /openapi.json).
+app.add_middleware(BasicAuthMiddleware)
 
 
 @app.exception_handler(NotFoundError)
